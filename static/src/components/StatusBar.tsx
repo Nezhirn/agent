@@ -6,7 +6,7 @@ import { Brain, Pencil, Wrench, ShieldQuestion, Loader2, Wifi, WifiOff, Shield, 
 interface Props {
   phase: Phase;
   startTime: number | null;
-  wsStatus?: 'connected' | 'connecting' | 'disconnected';
+  wsStatus?: 'connected' | 'connecting' | 'reconnecting' | 'disconnected';
   allowAll?: boolean;
   onToggleAllowAll?: () => void;
 }
@@ -80,6 +80,7 @@ export default function StatusBar({ phase, startTime, wsStatus = 'connected', al
   const wsConfig = {
     connected: { icon: Wifi, color: 'text-success', label: 'Подключено' },
     connecting: { icon: Wifi, color: 'text-warning', label: 'Подключение...' },
+    reconnecting: { icon: Wifi, color: 'text-warning', label: 'Переподключение...' },
     disconnected: { icon: WifiOff, color: 'text-error', label: 'Нет соединения' },
   };
   const wsInfo = wsConfig[wsStatus];
@@ -170,7 +171,7 @@ export default function StatusBar({ phase, startTime, wsStatus = 'connected', al
         )}
         <div className={`flex items-center gap-1.5 ${wsInfo.color}`}>
           <motion.div
-            animate={wsStatus === 'connecting' ? { opacity: [1, 0.3, 1] } : {}}
+            animate={wsStatus === 'connecting' || wsStatus === 'reconnecting' ? { opacity: [1, 0.3, 1] } : {}}
             transition={{ duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
           >
             <WsIcon size={14} />

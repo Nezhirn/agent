@@ -21,7 +21,7 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
-  const [wsStatus, setWsStatus] = useState<'connected' | 'connecting' | 'disconnected'>('connecting');
+  const [wsStatus, setWsStatus] = useState<'connected' | 'connecting' | 'reconnecting' | 'disconnected'>('connecting');
   const [allowAll, setAllowAll] = useState(false);
 
   const [streaming, setStreaming] = useState<StreamingMessage>({
@@ -70,7 +70,8 @@ export function App() {
   const connectWs = useCallback(
     (sessionId: string) => {
       disconnectWs();
-      setWsStatus('connecting');
+      // Используем 'reconnecting' если это не первая попытка
+      setWsStatus(reconnectAttempts.current > 0 ? 'reconnecting' : 'connecting');
       const ws = api.createWebSocket(sessionId);
       wsRef.current = ws;
 
@@ -90,19 +91,24 @@ export function App() {
       };
 
       ws.onclose = (event) => {
-        setWsStatus('disconnected');
         // Не reconnect если:
         // 1. Сессия изменилась (пользователь переключился)
         // 2. Нормальное закрытие (1000, 1001, 1012 - reload сервера)
         // 3. Превышено количество попыток
         const isNormalClose = [1000, 1001, 1012, 1013].includes(event.code);
         const sessionChanged = currentSessionRef.current?.id !== sessionId;
-        
-        if (sessionChanged || isNormalClose || reconnectAttempts.current >= 5) {
+        const maxAttemptsReached = reconnectAttempts.current >= 5;
+
+        if (sessionChanged || isNormalClose || maxAttemptsReached) {
+          // Окончательное отключение
+          setWsStatus('disconnected');
           reconnectAttempts.current = 0;
           return;
         }
-        
+
+        // Начинаем переподключение — статус 'reconnecting'
+        setWsStatus('reconnecting');
+
         // Reconnect только для той же сессии
         const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 10000);
         reconnectTimer.current = setTimeout(() => {
