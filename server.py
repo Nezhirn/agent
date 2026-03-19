@@ -14,6 +14,7 @@ Qwen Agent — FastAPI + WebSocket + Qwen CLI + MCP
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
+from system_prompt import SYSTEM_PROMPT
 
 import asyncio
 import json
@@ -75,7 +76,7 @@ TOOLS_REQUIRING_CONFIRMATION = {
 }
 
 # Лимиты безопасности
-MAX_REQUEST_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_REQUEST_SIZE = 50 * 1024 * 1024  # 50 MB
 
 
 class RequestSizeLimitMiddleware:
@@ -121,86 +122,6 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
-SYSTEM_PROMPT = """Ты — Qwen Agent, автономный AI-ассистент для работы на Linux-сервере.
-Твоя задача — эффективно решать задачи пользователя, используя доступные инструменты.
-
-═══ ТВОЯ СРЕДА ═══
-• ОС: Linux (Fedora-based)
-• Хостнейм: qwen-agent
-• Python: 3.14.3
-• Ты работаешь на выделенном сервере, посвящённом тебе и твоему сервису.
-• Домашняя директория пользователя: /home/andrew
-• Рабочая директория сервиса: /home/andrew/qwen-agent
-
-═══ ИНСТРУМЕНТЫ ═══
-
-🔹 ТЫ ИСПОЛЬЗУЕШЬ ВСЕ ИНСТРУМЕНТЫ НАТИВНО (через qwen-code):
-
-   run_shell_command(command: str) — bash команды
-   read_file(absolute_path: str) — чтение файлов
-   write_file(path: str, content: str) — запись файлов
-   edit_file(path: str, old_string: str, new_string: str) — редактирование файлов
-   list_directory(path: str) — список файлов в директории
-   glob(pattern: str, path: str) — поиск файлов по шаблону
-   grep_search(pattern: str, path: str) — поиск по содержимому файлов
-   web_fetch(url: str) — загрузка веб-страницы
-   web_search(query: str) — поиск в интернете
-   todo_write(todos: list) — управление задачами
-   todo_read() — чтение списка задач
-   save_memory(fact: str, scope: str) — сохранение в память
-   read_memory() — чтение памяти
-
-═══ КОНТЕКСТ И ПАМЯТЬ ═══
-• История чата доступна полностью — читай сообщения, а не read_memory.
-• read_memory возвращает ТОЛЬКО сохранённое через save_memory.
-• Сохраняй важные факты: IP, домены, пути, имена, настройки, предпочтения.
-• Память сохраняется между сессиями одного чата.
-
-═══ ПРИНЦИПЫ РАБОТЫ ═══
-
-1. 🚀 ДЕЙСТВУЙ, НЕ РАССУЖДАЙ
-   • Вместо «я могу выполнить команду» — сразу вызывай инструмент.
-   • Вместо «вам нужно сделать X» — сделай X.
-
-2. 📋 РАЗБИВАЙ СЛОЖНЫЕ ЗАДАЧИ
-   • Декомпозируй на последовательные шаги.
-   • Выполняй шаг за шагом, используя результаты предыдущих.
-
-3. 🎯 МИНИМУМ ТЕКСТА, МАКСИМУМ ДЕЛА
-   • Вызывай инструменты без лишних объяснений.
-   • Кратко комментируй только ключевые шаги.
-
-4. 🧠 ЗАПОМИНАЙ ВАЖНОЕ
-   • Узнал IP/домен/путь/конфиг → save_memory.
-   • Пользователь назвал предпочтения → save_memory.
-
-5. ✅ ПРОВЕРЯЙ РЕЗУЛЬТАТЫ
-   • После команды проверяй вывод на ошибки.
-   • Если ошибка — анализируй и исправляй.
-
-6. 🔒 БЕЗОПАСНОСТЬ
-   • Не выполняй деструктивные действия без явного запроса.
-
-═══ ПРИМЕРЫ ═══
-
-❌ ПЛОХО: «Я могу проверить содержимое директории командой ls»
-✅ ХОРОШО: [вызов list_directory(path="/home/andrew/qwen-agent")]
-
-❌ ПЛОХО: «Вам нужно установить пакет через pip»
-✅ ХОРОШО: [вызов run_bash_command("pip install package-name")]
-
-❌ ПЛОХО: «Где находится проект? Я не вижу пути»
-✅ ХОРОШО: [вызов list_directory()] или [read_memory()]
-
-═══ СЕРВИС QWEN-AGENT ═══
-Ты работаешь в сервисе qwen-agent — веб-интерфейсе для qwen-cli.
-• Сервер: FastAPI на порту 10310
-• Фронтенд: React + TypeScript + Vite в /home/andrew/qwen-agent/static/
-• MCP-сервер: /home/andrew/qwen-agent/mcp_tools_server.py
-• База данных: SQLite /home/andrew/qwen-agent/sessions.db
-• Логи: /home/andrew/qwen-agent/server.log
-
-Ты — хозяин этой машины. Используй все инструменты для эффективной работы."""
 
 # ─── База данных ────────────────────────────────────────────────
 
@@ -572,13 +493,21 @@ async def _safe_send(ws: WebSocket, data: dict):
 async def _wait_for_confirmation(
     confirm_queue: asyncio.Queue,
     stop_event: asyncio.Event,
-    timeout: float = 300,
+    timeout: float = 120,
 ) -> str:
-    """Ждёт подтверждения от пользователя через confirm_queue."""
+    """Ждёт подтверждения от пользователя через confirm_queue.
+    Возвращает 'stop' если:
+    - stop_event установлен
+    - истёк таймаут
+    - получено None (соединение закрыто)
+    """
     if stop_event.is_set():
         return "stop"
+
+    # Создаём задачи для ожидания
     queue_task = asyncio.create_task(confirm_queue.get())
     stop_task = asyncio.create_task(stop_event.wait())
+
     try:
         done, pending = await asyncio.wait(
             {queue_task, stop_task},
@@ -589,19 +518,27 @@ async def _wait_for_confirmation(
         queue_task.cancel()
         stop_task.cancel()
         return "stop"
-    for p in pending:
-        p.cancel()
+    finally:
+        # Гарантированно отменяем все pending задачи
+        for p in pending:
+            p.cancel()
+
+    # Проверяем что произошло
     if stop_task in done or stop_event.is_set():
         return "stop"
+
     if queue_task in done:
         data = queue_task.result()
+        # None означает что соединение закрыто
         if data is None:
             return "stop"
         if isinstance(data, str):
             return data
         if isinstance(data, dict):
             return data.get("action", "deny")
-    return "deny"
+
+    # Таймаут - возвращаем stop чтобы не ждать вечно
+    return "stop"
 
 
 async def _wait_for_init_response(proc, timeout=10):
@@ -824,7 +761,26 @@ async def stream_chat_background(
                 pending_tool_calls, connection_state, confirm_queue,
                 stop_event, session_id, tool_results_log
             )
-
+    except asyncio.CancelledError:
+        # Задача отменена - корректно завершаем процесс и отправляем сигнал
+        logger.info(f"Задача отменена для сессии {session_id}")
+        _kill_proc(proc)
+        # Сохраняем накопленный контент
+        if content_buffer or thinking_buffer or tool_calls_log:
+            if tool_calls_log:
+                save_message(session_id, "assistant_tool_call",
+                            content_buffer, thinking=thinking_buffer,
+                            tool_calls=tool_calls_log)
+                for tr in tool_results_log:
+                    save_message(session_id, "tool", tr["content"], tool_name=tr["tool_name"])
+            else:
+                save_message(session_id, "assistant", content_buffer, thinking=thinking_buffer)
+        try:
+            await _safe_send(ws, {"type": "stopped"})
+        except Exception:
+            pass
+        # Пробрасываем CancelledError дальше
+        raise
     except Exception as e:
         logger.error(f"Ошибка: {e}", exc_info=True)
         await _safe_send(ws, {"type": "error", "content": str(e)})
@@ -1297,6 +1253,22 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                 try:
                     await background_task
                     logger.info(f"Задача завершена для сессии {session_id}")
+                except asyncio.CancelledError:
+                    # Задача была отменена - корректно завершаем
+                    logger.info(f"Задача отменена для сессии {session_id}")
+                    # Отправляем сигнал остановки в background_task через confirm_queue
+                    if session_id in background_tasks:
+                        try:
+                            await background_tasks[session_id]["confirm_queue"].put(None)
+                        except Exception:
+                            pass
+                        # Принудительно останавливаем задачу
+                        background_tasks[session_id]["stop_event"].set()
+                        try:
+                            await asyncio.wait_for(background_task, timeout=2)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            background_task.cancel()
+                    break
                 except Exception as e:
                     logger.error(f"Ошибка в background_task: {e}", exc_info=True)
                     try:
@@ -1308,8 +1280,20 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                     if session_id in background_tasks and background_tasks[session_id]["task"] == background_task:
                         del background_tasks[session_id]
     except asyncio.CancelledError:
-        # Нормальное завершение при shutdown
-        pass
+        # Нормальное завершение при shutdown - отменяем все задачи
+        if session_id in background_tasks:
+            background_tasks[session_id]["stop_event"].set()
+            try:
+                await background_tasks[session_id]["confirm_queue"].put(None)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(background_tasks[session_id]["task"], timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                background_tasks[session_id]["task"].cancel()
+            finally:
+                if session_id in background_tasks:
+                    del background_tasks[session_id]
     except Exception as e:
         logger.error(f"WebSocket ошибка: {e}", exc_info=True)
     finally:
@@ -1319,6 +1303,20 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
             await reader_task
         except (asyncio.CancelledError, Exception):
             pass
+        # Также отменяем background_task если она ещё выполняется
+        if session_id in background_tasks:
+            background_tasks[session_id]["stop_event"].set()
+            try:
+                await background_tasks[session_id]["confirm_queue"].put(None)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(background_tasks[session_id]["task"], timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                background_tasks[session_id]["task"].cancel()
+            finally:
+                if session_id in background_tasks:
+                    del background_tasks[session_id]
         logger.info(f"WebSocket сессия завершена: {session_id}")
 
 
@@ -1335,4 +1333,4 @@ async def spa_fallback(request: Request, path: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=10310, reload=True, log_level="info")
+    uvicorn.run("server:app", host="0.0.0.0", port=10310, reload=False, log_level="info")

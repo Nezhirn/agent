@@ -4,8 +4,11 @@ MCP Server для Qwen Agent
 Инструменты требующие контроля: bash, ssh, write_file, edit_file
 """
 
+import os
+import signal
 import sqlite3
 import subprocess
+import threading
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -19,18 +22,51 @@ DB_PATH = str(Path(__file__).parent / "sessions.db")
 @mcp.tool()
 def run_bash_command(command: str) -> str:
     """Исполняет bash команду на локальном сервере.
-    
+
     Требует подтверждения пользователя перед выполнением.
     Таймаут: 120 секунд.
     """
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=120
+        # Используем Popen с явной группой процессов для надёжного таймаута
+        # Это избегает проблем с shell=True зависанием навсегда
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=True,
+            preexec_fn=os.setsid  # Создаём новую группу процессов для корректного завершения
         )
-        output = result.stdout + result.stderr
-        return output[:8000] if output else "(пустой вывод)"
-    except subprocess.TimeoutExpired:
-        return "Error: команда превысила таймаут в 120 секунд"
+
+        # Используем threading для более надёжного таймаута
+        def kill_process():
+            try:
+                # Убиваем всю группу процессов
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+
+        # Запускаем таймер для таймаута
+        timer = threading.Timer(120.0, kill_process)
+        timer.start()
+
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+            timer.cancel()  # Отменяем таймер если процесс завершился вовремя
+
+            output = stdout + stderr
+            return output[:8000] if output else "(пустой вывод)"
+        except subprocess.TimeoutExpired:
+            # Процесс не завершился - kill_process уже был вызван таймером
+            return "Error: команда превысила таймаут в 120 секунд"
+        except Exception as e:
+            timer.cancel()
+            return f"Error: {str(e)}"
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -38,7 +74,7 @@ def run_bash_command(command: str) -> str:
 @mcp.tool()
 def run_ssh_command(host: str, command: str, user: str = "root") -> str:
     """Подключается по SSH к удалённому серверу и исполняет команду.
-    
+
     Требует настроенного SSH ключа (~/.ssh/id_ed25519).
     Требует подтверждения пользователя перед выполнением.
     Таймаут: 120 секунд.
@@ -51,13 +87,38 @@ def run_ssh_command(host: str, command: str, user: str = "root") -> str:
             f"{user}@{host}",
             command
         ]
-        result = subprocess.run(
-            ssh_cmd, capture_output=True, text=True, timeout=120
+
+        # Используем Popen с таймером для надёжного таймаута
+        process = subprocess.Popen(
+            ssh_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
         )
-        output = result.stdout + result.stderr
-        return output[:8000] if output else "(пустой вывод)"
-    except subprocess.TimeoutExpired:
-        return "Error: команда превысила таймаут в 120 секунд"
+
+        def kill_process():
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+        timer = threading.Timer(120.0, kill_process)
+        timer.start()
+
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+            timer.cancel()
+            output = stdout + stderr
+            return output[:8000] if output else "(пустой вывод)"
+        except subprocess.TimeoutExpired:
+            return "Error: команда превысила таймаут в 120 секунд"
+        except Exception as e:
+            timer.cancel()
+            return f"SSH Error: {str(e)}"
     except Exception as e:
         return f"SSH Error: {str(e)}"
 
