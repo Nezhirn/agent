@@ -1,6 +1,6 @@
 # Thule UI
 
-![Описание картинки](https://lh3.googleusercontent.com/d/1L6Ya-BCRb8AdSndyjB2mLf0GiPzCwwVK)
+![Описание картинки](https://lh3.googleusercontent.com/d/1cDvUGr14z_TQCkMs_zi-qjy7IY6xiLq1)
 **Веб-интерфейс для AI CLI с поддержкой MCP инструментов и множественных провайдеров**
 
 ---
