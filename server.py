@@ -336,13 +336,20 @@ class MCPSessionManager:
             cwd=str(Path(__file__).parent),
             env=env,
         )
-        self._cm_stdio = stdio_client(params)
-        read, write = await self._cm_stdio.__aenter__()
 
-        self._cm_client = ClientSession(read, write)
-        self._session = await self._cm_client.__aenter__()
-        await self._session.initialize()
-        self._connected = True
+        # Таймаут на создание MCP сессии (30 секунд)
+        try:
+            self._cm_stdio = stdio_client(params)
+            read, write = await asyncio.wait_for(self._cm_stdio.__aenter__(), timeout=30.0)
+
+            self._cm_client = ClientSession(read, write)
+            self._session = await asyncio.wait_for(self._cm_client.__aenter__(), timeout=30.0)
+            await asyncio.wait_for(self._session.initialize(), timeout=30.0)
+            self._connected = True
+        except asyncio.TimeoutError:
+            logger.error("MCP session creation timeout (30s)")
+            await self._close_internal()
+            raise TimeoutError("Не удалось создать MCP сессию: таймаут 30 секунд")
 
     async def _close_internal(self):
         """Закрывает ресурсы. Вызывать ТОЛЬКО под self._lock."""
@@ -368,12 +375,22 @@ class MCPSessionManager:
         await self._create_session()
         return self._session
 
-    async def call_tool(self, name: str, arguments: dict):
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 180.0):
         async with self._lock:
             try:
                 session = await self._ensure_session()
-                result = await session.call_tool(name, arguments=arguments)
+                # Добавляем таймаут на вызов MCP инструмента
+                result = await asyncio.wait_for(
+                    session.call_tool(name, arguments=arguments),
+                    timeout=timeout
+                )
                 return result
+            except asyncio.TimeoutError:
+                # Таймаут MCP вызова - пересоздаём сессию
+                logger.error(f"MCP tool {name} timeout after {timeout}s")
+                self._connected = False
+                self._session = None
+                raise TimeoutError(f"MCP tool {name} превысил таймаут {timeout} секунд")
             except asyncio.CancelledError:
                 # CancelledError — НЕ маркируем сессию как сломанную
                 raise
@@ -386,7 +403,8 @@ class MCPSessionManager:
     async def list_tools(self):
         async with self._lock:
             session = await self._ensure_session()
-            tools_list = await session.list_tools()
+            # Таймаут на получение списка инструментов
+            tools_list = await asyncio.wait_for(session.list_tools(), timeout=10.0)
             return [
                 {
                     "type": "function",
@@ -411,8 +429,16 @@ async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "") ->
     # Для memory-инструментов передаём session_id как аргумент
     if tool_name in ("save_memory", "read_memory", "delete_memory") and session_id:
         arguments = {**arguments, "session_id": session_id}
-    result = await mcp_manager.call_tool(tool_name, arguments)
-    return getattr(result, "content", [{"text": str(result)}])[0].text if getattr(result, "content", None) else "(пустой результат)"
+
+    # Таймаут 180 секунд для MCP инструментов (bash команды имеют свой таймаут 120 сек)
+    try:
+        result = await mcp_manager.call_tool(tool_name, arguments, timeout=180.0)
+        return getattr(result, "content", [{"text": str(result)}])[0].text if getattr(result, "content", None) else "(пустой результат)"
+    except TimeoutError as e:
+        return f"Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"MCP tool {tool_name} error: {e}", exc_info=True)
+        return f"Error: {str(e)}"
 
 
 # Кэш для списка инструментов (не меняется в runtime)
@@ -493,7 +519,7 @@ async def _safe_send(ws: WebSocket, data: dict):
 async def _wait_for_confirmation(
     confirm_queue: asyncio.Queue,
     stop_event: asyncio.Event,
-    timeout: float = 120,
+    timeout: float = 300,
 ) -> str:
     """Ждёт подтверждения от пользователя через confirm_queue.
     Возвращает 'stop' если:
@@ -541,7 +567,7 @@ async def _wait_for_confirmation(
     return "stop"
 
 
-async def _wait_for_init_response(proc, timeout=10):
+async def _wait_for_init_response(proc, timeout=30):
     """Ждёт control_response на initialize от qwen."""
     import time
     start = time.time()
@@ -558,6 +584,7 @@ async def _wait_for_init_response(proc, timeout=10):
                 return data
         except Exception:
             continue
+    logger.warning(f"Таймаут ожидания init response от qwen ({timeout}s)")
     return None
 
 
@@ -612,18 +639,33 @@ async def _async_readline(proc) -> str:
 
 def _kill_proc(proc):
     """Безопасно завершает процесс через process group."""
+    if proc is None:
+        return
+
     try:
         proc.stdin.close()
     except Exception:
         pass
+
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)  # Убиваем всю группу
-        proc.wait(timeout=5)
-    except Exception:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
+        # Проверяем что процесс ещё жив
+        if proc.poll() is None:
+            try:
+                # Пытаемся убить через process group
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=5)
+            except ProcessLookupError:
+                # Процесс уже завершён
+                pass
+            except Exception as e:
+                logger.warning(f"SIGTERM failed: {e}, trying SIGKILL")
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=2)
+                except Exception as e2:
+                    logger.error(f"SIGKILL failed: {e2}")
+    except Exception as e:
+        logger.error(f"Failed to kill process: {e}")
 
 
 async def stream_chat_background(
@@ -660,29 +702,49 @@ async def stream_chat_background(
     tool_calls_log = []
     tool_results_log = []  # Копим tool результаты для сохранения в правильном порядке
     pending_tool_calls = {}  # tool_use_id -> tool_info
+    last_tool_call_time = None  # Время последнего вызова BASH инструмента
+    TOOL_EXECUTION_TIMEOUT = 180.0  # Максимальное время выполнения BASH команды (секунды)
+
+    # Инструменты, для которых применяется таймаут (только bash/shell команды)
+    BASH_TOOLS = {"run_shell_command", "run_bash_command", "execute_command", "run_command", "shell", "bash"}
 
     proc = None
     try:
         # Если в БД есть предыдущие сообщения (не только текущее) — resume
         has_history = len(db_messages) > 1
-        
+
         # Проверяем что session_id — полный UUID (36 символов)
         is_valid_uuid = len(session_id) == 36 and session_id.count('-') == 4
 
+        # Если есть кастомный промпт — НЕ используем qwen session management
+        use_full_history = custom_prompt is not None
+
         # SDK mode: инициализация и отправка через stdin
-        if has_history and is_valid_uuid:
+        if use_full_history:
+            # Кастомный промпт: запускаем БЕЗ --session-id/--resume
+            # Управляем историей сами через SQLite
+            proc = run_qwen_cli_sdk()
+        elif has_history and is_valid_uuid:
+            # Нет кастомного промпта + есть история: используем --resume
             proc = run_qwen_cli_sdk(resume_id=session_id)
         elif is_valid_uuid:
+            # Нет кастомного промпта + первое сообщение: создаём сессию
             proc = run_qwen_cli_sdk(session_id=session_id)
         else:
             # Старая сессия с коротким ID — без контекста qwen
             proc = run_qwen_cli_sdk()
 
         # 1. Инициализируем SDK mode
+        init_request = {"subtype": "initialize"}
+
+        # Если есть кастомный промпт, пробуем передать его в инициализации
+        if use_full_history and custom_prompt:
+            init_request["system_prompt"] = custom_prompt
+
         init_msg = json.dumps({
             "type": "control_request",
             "request_id": "init-001",
-            "request": {"subtype": "initialize"}
+            "request": init_request
         })
         proc.stdin.write(init_msg + "\n")
         proc.stdin.flush()
@@ -693,12 +755,102 @@ async def stream_chat_background(
         # Fallback: если процесс умер (например --resume на несуществующей сессии)
         if init_resp is None and proc.poll() is not None:
             logger.warning(f"qwen процесс завершился, пробуем без --resume (session_id={session_id})")
-            proc = run_qwen_cli_sdk(session_id=session_id)
-            proc.stdin.write(init_msg + "\n")
+            proc = run_qwen_cli_sdk()
+            init_msg_fallback = json.dumps({
+                "type": "control_request",
+                "request_id": "init-002",
+                "request": {"subtype": "initialize"}
+            })
+            proc.stdin.write(init_msg_fallback + "\n")
             proc.stdin.flush()
             await _wait_for_init_response(proc)
+            use_full_history = True  # После fallback отправляем полную историю
 
-        # 2. Отправляем сообщение пользователя
+        # 2. Отправляем полную историю если нужно (кастомный промпт или fallback)
+        if use_full_history:
+            # Если system_prompt не был принят в init, отправляем как первое сообщение
+            effective_prompt = custom_prompt if custom_prompt else SYSTEM_PROMPT
+
+            # Пробуем отправить как user message с system content
+            system_as_user = json.dumps({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"[SYSTEM INSTRUCTION]\n{effective_prompt}\n[END SYSTEM INSTRUCTION]"
+                        }
+                    ]
+                }
+            })
+            proc.stdin.write(system_as_user + "\n")
+            proc.stdin.flush()
+
+            # Отправляем фейковый assistant ack
+            ack_msg = json.dumps({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Understood. I will follow these instructions."}]
+                }
+            })
+            proc.stdin.write(ack_msg + "\n")
+            proc.stdin.flush()
+            logger.info(f"Sent system prompt as conversation for session {session_id}")
+
+            # Отправляем все предыдущие сообщения (кроме последнего user message)
+            for msg in db_messages[:-1]:  # Исключаем последнее (текущее) сообщение
+                if msg["role"] == "user":
+                    msg_data = json.dumps({
+                        "type": "user",
+                        "message": {"role": "user", "content": msg["content"]}
+                    })
+                    proc.stdin.write(msg_data + "\n")
+                    proc.stdin.flush()
+                elif msg["role"] == "assistant":
+                    msg_data = json.dumps({
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": msg["content"]}]}
+                    })
+                    proc.stdin.write(msg_data + "\n")
+                    proc.stdin.flush()
+                elif msg["role"] == "assistant_tool_call":
+                    tool_calls = json.loads(msg["tool_calls"]) if msg["tool_calls"] else []
+                    content_parts = []
+                    if msg["content"]:
+                        content_parts.append({"type": "text", "text": msg["content"]})
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        content_parts.append({
+                            "type": "tool_use",
+                            "id": f"tool_{hash(func.get('name', ''))}",
+                            "name": func.get("name", ""),
+                            "input": func.get("arguments", {})
+                        })
+                    msg_data = json.dumps({
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": content_parts}
+                    })
+                    proc.stdin.write(msg_data + "\n")
+                    proc.stdin.flush()
+                elif msg["role"] == "tool":
+                    # Tool results нужно отправлять как user message с tool_result
+                    msg_data = json.dumps({
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": f"tool_{hash(msg.get('tool_name', ''))}",
+                                "content": msg["content"]
+                            }]
+                        }
+                    })
+                    proc.stdin.write(msg_data + "\n")
+                    proc.stdin.flush()
+
+        # 3. Отправляем текущее сообщение пользователя
         user_msg = json.dumps({
             "type": "user",
             "message": {"role": "user", "content": user_message}
@@ -709,6 +861,52 @@ async def stream_chat_background(
         # 3. Читаем поток
         done = False
         while not done:
+            # Проверяем таймаут выполнения BASH инструмента
+            if last_tool_call_time is not None:
+                elapsed = asyncio.get_event_loop().time() - last_tool_call_time
+                if elapsed > TOOL_EXECUTION_TIMEOUT:
+                    logger.error(f"Bash command timeout ({TOOL_EXECUTION_TIMEOUT}s exceeded) for session {session_id}")
+
+                    # СНАЧАЛА отправляем tool_result для всех pending инструментов
+                    timeout_message = f"⏱️ Таймаут выполнения ({TOOL_EXECUTION_TIMEOUT:.0f} секунд). Операция прервана."
+                    for tool_id, tool_info in list(pending_tool_calls.items()):
+                        tool_name = tool_info.get("name", "")
+                        await _safe_send(ws, {
+                            "type": "tool_result",
+                            "name": tool_name,
+                            "content": timeout_message
+                        })
+                        # Добавляем в лог результатов для сохранения
+                        tool_results_log.append({
+                            "content": timeout_message,
+                            "tool_name": tool_name
+                        })
+                    pending_tool_calls.clear()
+
+                    # Затем отправляем сообщения о завершении
+                    await _safe_send(ws, {
+                        "type": "error",
+                        "content": timeout_message
+                    })
+                    await _safe_send(ws, {"type": "stream_end"})
+                    await _safe_send(ws, {"type": "response_end"})
+
+                    # ПОТОМ убиваем процесс
+                    _kill_proc(proc)
+
+                    # Сохраняем накопленный контент
+                    if content_buffer or thinking_buffer or tool_calls_log:
+                        if tool_calls_log:
+                            save_message(session_id, "assistant_tool_call",
+                                        content_buffer, thinking=thinking_buffer,
+                                        tool_calls=tool_calls_log)
+                            for tr in tool_results_log:
+                                save_message(session_id, "tool", tr["content"], tool_name=tr["tool_name"])
+                        else:
+                            save_message(session_id, "assistant", content_buffer, thinking=thinking_buffer)
+
+                    return
+
             if stop_event.is_set():
                 _kill_proc(proc)
                 # Сохраняем накопленный контент ДО отправки stopped
@@ -731,35 +929,44 @@ async def stream_chat_background(
 
             # Проверяем завершение процесса
             if proc.poll() is not None:
-                # Читаем остаток stdout
-                remaining = proc.stdout.read()
-                if remaining:
-                    for line in remaining.splitlines():
-                        thinking_buffer, content_buffer, done = await _process_line(
-                            ws, line, proc, thinking_buffer, content_buffer, tool_calls_log,
-                            pending_tool_calls, connection_state, confirm_queue,
-                            stop_event, session_id, tool_results_log
-                        )
-                        if done:
-                            break
+                # Читаем остаток stdout с таймаутом
+                try:
+                    remaining = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(None, proc.stdout.read),
+                        timeout=5.0
+                    )
+                    if remaining:
+                        for line in remaining.splitlines():
+                            thinking_buffer, content_buffer, done, last_tool_call_time = await _process_line(
+                                ws, line, proc, thinking_buffer, content_buffer, tool_calls_log,
+                                pending_tool_calls, connection_state, confirm_queue,
+                                stop_event, session_id, tool_results_log, last_tool_call_time, BASH_TOOLS
+                            )
+                            if done:
+                                break
+                except asyncio.TimeoutError:
+                    logger.warning(f"Таймаут чтения остатка stdout (session_id={session_id})")
                 break
 
             try:
-                line = await asyncio.wait_for(_async_readline(proc), timeout=600)
+                # Таймаут 300 секунд (5 минут) для чтения ответа от qwen
+                line = await asyncio.wait_for(_async_readline(proc), timeout=300)
             except asyncio.TimeoutError:
+                logger.error(f"Таймаут чтения от qwen процесса (session_id={session_id})")
                 _kill_proc(proc)
-                await _safe_send(ws, {"type": "error", "content": "Таймаут ожидания ответа qwen"})
-                break
+                await _safe_send(ws, {"type": "error", "content": "Таймаут ожидания ответа (5 минут). Процесс остановлен."})
+                await _safe_send(ws, {"type": "response_end"})
+                return  # Полностью завершаем функцию
 
             if not line:
                 if proc.poll() is not None:
                     break
                 continue
 
-            thinking_buffer, content_buffer, done = await _process_line(
+            thinking_buffer, content_buffer, done, last_tool_call_time = await _process_line(
                 ws, line, proc, thinking_buffer, content_buffer, tool_calls_log,
                 pending_tool_calls, connection_state, confirm_queue,
-                stop_event, session_id, tool_results_log
+                stop_event, session_id, tool_results_log, last_tool_call_time, BASH_TOOLS
             )
     except asyncio.CancelledError:
         # Задача отменена - корректно завершаем процесс и отправляем сигнал
@@ -782,11 +989,15 @@ async def stream_chat_background(
         # Пробрасываем CancelledError дальше
         raise
     except Exception as e:
-        logger.error(f"Ошибка: {e}", exc_info=True)
-        await _safe_send(ws, {"type": "error", "content": str(e)})
+        logger.error(f"Ошибка в stream_chat_background (session_id={session_id}): {e}", exc_info=True)
+        await _safe_send(ws, {"type": "error", "content": f"Внутренняя ошибка: {str(e)}"})
     finally:
-        if proc and proc.poll() is None:
-            _kill_proc(proc)
+        if proc:
+            if proc.poll() is None:
+                logger.info(f"Завершаем qwen процесс (session_id={session_id})")
+                _kill_proc(proc)
+            else:
+                logger.debug(f"qwen процесс уже завершён (session_id={session_id}, exit_code={proc.poll()})")
 
     # Сохраняем в БД в правильном порядке: assistant_tool_call → tool × N
     if content_buffer or thinking_buffer or tool_calls_log:
@@ -818,18 +1029,20 @@ async def _process_line(
     stop_event: asyncio.Event,
     session_id: str,
     tool_results_log: list,
+    last_tool_call_time: float = None,
+    BASH_TOOLS: set = None,
 ) -> tuple:
     """Обрабатывает одну строку вывода qwen в SDK mode.
-    Возвращает (thinking_buffer, content_buffer, done).
+    Возвращает (thinking_buffer, content_buffer, done, last_tool_call_time).
     """
     line = line.strip()
     if not line:
-        return thinking_buffer, content_buffer, False
+        return thinking_buffer, content_buffer, False, last_tool_call_time
 
     try:
         data = json.loads(line)
     except json.JSONDecodeError:
-        return thinking_buffer, content_buffer, False
+        return thinking_buffer, content_buffer, False, last_tool_call_time
 
     tp = data.get("type", "")
 
@@ -858,7 +1071,7 @@ async def _process_line(
                     proc.stdin.flush()
                 except Exception:
                     pass
-                return thinking_buffer, content_buffer, False
+                return thinking_buffer, content_buffer, False, last_tool_call_time
 
             # Показываем confirm UI во фронте
             await _safe_send(ws, {
@@ -885,7 +1098,7 @@ async def _process_line(
                     proc.stdin.flush()
                 except Exception:
                     pass
-                return thinking_buffer, content_buffer, False
+                return thinking_buffer, content_buffer, False, last_tool_call_time
 
             elif action == "deny":
                 deny_resp = json.dumps({
@@ -902,7 +1115,7 @@ async def _process_line(
                 except Exception:
                     pass
                 await _safe_send(ws, {"type": "tool_denied", "name": tool_name})
-                return thinking_buffer, content_buffer, False
+                return thinking_buffer, content_buffer, False, last_tool_call_time
 
             else:
                 # allow или allow_all
@@ -924,15 +1137,15 @@ async def _process_line(
                 except Exception:
                     pass
 
-        return thinking_buffer, content_buffer, False
+        return thinking_buffer, content_buffer, False, last_tool_call_time
 
     # --- control_response: ответ от qwen (init и т.д.) ---
     if tp == "control_response":
-        return thinking_buffer, content_buffer, False
+        return thinking_buffer, content_buffer, False, last_tool_call_time
 
     # --- system: пропускаем ---
     if tp == "system":
-        return thinking_buffer, content_buffer, False
+        return thinking_buffer, content_buffer, False, last_tool_call_time
 
     # --- assistant: thinking, text, tool_use ---
     if tp == "assistant":
@@ -943,7 +1156,7 @@ async def _process_line(
             if content_list:
                 content_buffer += content_list
                 await _safe_send(ws, {"type": "content", "content": content_list})
-            return thinking_buffer, content_buffer, False
+            return thinking_buffer, content_buffer, False, last_tool_call_time
         
         for item in content_list:
             it = item.get("type", "")
@@ -965,6 +1178,10 @@ async def _process_line(
                 tool_args = item.get("input", {})
                 tool_id = item.get("id", "")
 
+                # Запоминаем время вызова ТОЛЬКО для bash команд
+                if tool_name in BASH_TOOLS:
+                    last_tool_call_time = asyncio.get_event_loop().time()
+
                 # Конвертируем в формат фронта
                 tool_calls_log.append({
                     "function": {
@@ -980,7 +1197,7 @@ async def _process_line(
                     "args": tool_args
                 })
 
-        return thinking_buffer, content_buffer, False
+        return thinking_buffer, content_buffer, False, last_tool_call_time
 
     # --- user (tool_result): qwen исполнил инструмент ---
     if tp == "user":
@@ -1019,13 +1236,16 @@ async def _process_line(
                 # Копим в лог (сохраним позже в правильном порядке)
                 tool_results_log.append({"content": tool_content, "tool_name": result_name})
 
-        return thinking_buffer, content_buffer, False
+                # Сбрасываем таймер после получения результата
+                last_tool_call_time = None
+
+        return thinking_buffer, content_buffer, False, last_tool_call_time
 
     # --- result: конец ---
     if tp == "result":
-        return thinking_buffer, content_buffer, True
+        return thinking_buffer, content_buffer, True, last_tool_call_time
 
-    return thinking_buffer, content_buffer, False
+    return thinking_buffer, content_buffer, False, last_tool_call_time
 
 
 # ─── FastAPI ────────────────────────────────────────────────────
@@ -1167,6 +1387,96 @@ async def api_task_status(sid: str):
         task_info = background_tasks[sid]
         return {"has_task": True, "done": task_info["task"].done(), "cancelled": task_info["task"].cancelled()}
     return {"has_task": False}
+
+
+@app.get("/api/sessions/{sid}/export")
+async def api_export_session(sid: str):
+    """Экспорт сессии в markdown файл."""
+    from fastapi.responses import Response
+    from urllib.parse import quote
+
+    # Получаем информацию о сессии
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    session = conn.execute("SELECT * FROM sessions WHERE id = ?", (sid,)).fetchone()
+    if not session:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Получаем все сообщения
+    messages = conn.execute(
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC",
+        (sid,)
+    ).fetchall()
+    conn.close()
+
+    # Формируем markdown
+    md_lines = []
+    md_lines.append(f"# {session['title']}")
+    md_lines.append(f"\n**Created:** {session['created_at']}")
+    md_lines.append(f"\n**Session ID:** `{sid}`\n")
+    md_lines.append("\n---\n")
+
+    for msg in messages:
+        role = msg['role']
+        content = msg['content'] or ""
+        thinking = msg['thinking'] or ""
+        tool_calls = json.loads(msg['tool_calls']) if msg['tool_calls'] else None
+        tool_name = msg['tool_name']
+
+        if role == "user":
+            md_lines.append("\n## 👤 User\n")
+            md_lines.append(f"{content}\n")
+            md_lines.append("\n---\n")
+
+        elif role == "assistant":
+            md_lines.append("\n## 🤖 Assistant\n")
+            if thinking:
+                md_lines.append("\n**Thinking:**\n")
+                md_lines.append(f"```\n{thinking}\n```\n")
+            if content:
+                md_lines.append(f"\n{content}\n")
+            md_lines.append("\n---\n")
+
+        elif role == "assistant_tool_call":
+            md_lines.append("\n## 🤖 Assistant\n")
+            if thinking:
+                md_lines.append("\n**Thinking:**\n")
+                md_lines.append(f"```\n{thinking}\n```\n")
+            if content:
+                md_lines.append(f"\n{content}\n")
+            if tool_calls:
+                md_lines.append("\n**Tools called:**\n")
+                for tc in tool_calls:
+                    func = tc.get('function', {})
+                    name = func.get('name', 'unknown')
+                    args = func.get('arguments', {})
+                    md_lines.append(f"\n- `{name}`\n")
+                    if args:
+                        md_lines.append(f"  ```json\n  {json.dumps(args, indent=2, ensure_ascii=False)}\n  ```\n")
+            md_lines.append("\n---\n")
+
+        elif role == "tool":
+            md_lines.append(f"\n**Tool result:** `{tool_name}`\n")
+            md_lines.append(f"```\n{content[:1000]}\n```\n")
+            if len(content) > 1000:
+                md_lines.append(f"\n*(truncated, {len(content)} chars total)*\n")
+            md_lines.append("\n---\n")
+
+    markdown_content = "".join(md_lines)
+
+    # Безопасное имя файла с поддержкой UTF-8 (RFC 5987)
+    title_safe = session['title'][:30].replace(" ", "_")
+    filename_ascii = f"chat_{sid[:8]}.md"
+    filename_utf8 = f"chat_{title_safe}_{sid[:8]}.md"
+
+    return Response(
+        content=markdown_content,
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename_ascii}"; filename*=UTF-8\'\'{quote(filename_utf8)}'
+        }
+    )
 
 
 

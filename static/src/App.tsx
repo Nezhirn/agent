@@ -415,6 +415,7 @@ export function App() {
           session={currentSession}
           onToggleSidebar={() => setSidebarOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
+          onExport={() => currentSession && api.exportSession(currentSession.id)}
         />
 
         <AnimatePresence mode="wait">

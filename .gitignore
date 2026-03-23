@@ -3,4 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.db
+*.md
 !.gitkeep
+FIXES
+*.env

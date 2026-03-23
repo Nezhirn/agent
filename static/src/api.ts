@@ -58,3 +58,13 @@ export function createWebSocket(sessionId: string): WebSocket {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return new WebSocket(`${protocol}//${window.location.host}/ws/${sessionId}`);
 }
+
+export function exportSession(sessionId: string): void {
+  const url = `${BASE}/api/sessions/${sessionId}/export`;
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = '';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}

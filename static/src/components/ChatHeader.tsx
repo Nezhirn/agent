@@ -1,17 +1,19 @@
 import { motion } from 'framer-motion';
 import type { Session } from '../types';
-import { Menu, Settings, Hash, Sparkles } from 'lucide-react';
+import { Menu, Settings, Hash, Sparkles, Download } from 'lucide-react';
 
 interface Props {
   session: Session | null;
   onToggleSidebar: () => void;
   onOpenSettings: () => void;
+  onExport: () => void;
 }
 
 export default function ChatHeader({
   session,
   onToggleSidebar,
   onOpenSettings,
+  onExport,
 }: Props) {
   return (
     <header className="h-14 flex-shrink-0 glass border-b border-border/50 flex items-center justify-between px-4 z-10 relative">
@@ -46,16 +48,28 @@ export default function ChatHeader({
       </div>
 
       {session && (
-        <motion.button
-          initial={{ opacity: 0, rotate: -180 }}
-          animate={{ opacity: 1, rotate: 0 }}
-          transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-          onClick={onOpenSettings}
-          className="p-2 rounded-xl hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-all duration-300 hover:rotate-90 active:scale-90"
-          title="Настройки"
-        >
-          <Settings size={17} />
-        </motion.button>
+        <div className="flex items-center gap-2">
+          <motion.button
+            initial={{ opacity: 0, scale: 0.8 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+            onClick={onExport}
+            className="p-2 rounded-xl hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-all duration-200 active:scale-90"
+            title="Экспорт в Markdown"
+          >
+            <Download size={17} />
+          </motion.button>
+          <motion.button
+            initial={{ opacity: 0, rotate: -180 }}
+            animate={{ opacity: 1, rotate: 0 }}
+            transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+            onClick={onOpenSettings}
+            className="p-2 rounded-xl hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-all duration-300 hover:rotate-90 active:scale-90"
+            title="Настройки"
+          >
+            <Settings size={17} />
+          </motion.button>
+        </div>
       )}
     </header>
   );
