@@ -1,6 +1,6 @@
-# Документация сервиса Qwen Agent
+# Документация сервиса Thule UI
 
-**Версия:** 1.1.0
+**Версия:** 2.0.0
 **Авторы:** Claude Opus 4.6 + Qwen Code 3.5
 **Дата:** Март 2026
 
@@ -23,15 +23,18 @@
 
 ## 1. Обзор системы
 
-Qwen Agent — это полнофункциональный веб-интерфейс для работы с AI-ассистентом Qwen через командную строку (qwen-cli). Система построена на архитектуре клиент-сервер с использованием WebSocket для реального времени.
+Thule UI — это полнофункциональный веб-интерфейс для работы с AI-ассистентами (Qwen, Claude) через CLI. Система построена на архитектуре клиент-сервер с использованием WebSocket для реального времени.
 
 ### Ключевые возможности
 
+- **Мультипровайдерность** — поддержка Qwen и Claude с переключением на уровне сессии
+- **Выбор модели** — для Claude: opus/sonnet/haiku
 - **Чат-интерфейс** — веб-UI на React с поддержкой множественных сессий
 - **Стриминг ответов** — отображение процесса мышления модели в реальном времени
 - **MCP инструменты** — выполнение системных команд через Model Context Protocol
 - **Подтверждение операций** — UI для подтверждения опасных команд (bash, ssh, файлы)
 - **Долгосрочная память** — сохранение фактов между сессиями через SQLite
+- **Кастомные промпты** — индивидуальный системный промпт для каждой сессии
 
 ---
 
@@ -48,19 +51,45 @@ Qwen Agent — это полнофункциональный веб-интерф
 | Функция | Описание |
 |---------|----------|
 | `init_db()` | Инициализация SQLite базы данных |
-| `create_session()` | Создание новой чат-сессии |
+| `create_session()` | Создание новой чат-сессии с provider/model |
+| `get_sessions()` | Получение списка сессий |
 | `get_messages()` | Получение истории сообщений |
 | `save_message()` | Сохранение сообщения в БД |
-| `build_history()` | Построение контекста для qwen CLI |
-| `stream_chat_background()` | Асинхронная обработка запроса к qwen |
+| `build_history()` | Построение контекста для CLI |
+| `stream_chat_background()` | Асинхронная обработка запроса к CLI |
 | `websocket_endpoint()` | Обработка WebSocket соединений |
+
+**Provider абстракция:**
+
+```python
+class CLIProvider(ABC):
+    """Базовый класс для провайдеров CLI."""
+    
+    @abstractmethod
+    def get_command(self, session_id: Optional[str], model: Optional[str]) -> List[str]:
+        """Возвращает команду для запуска CLI."""
+    
+    @abstractmethod
+    def get_cli_path(self) -> Optional[str]:
+        """Возвращает путь к исполняемому файлу CLI."""
+
+class QwenCLIProvider(CLIProvider):
+    """Qwen CLI интеграция."""
+    def get_command(self, session_id, model):
+        return ["qwen", "--input-format", "stream-json", ...]
+
+class ClaudeCLIProvider(CLIProvider):
+    """Claude CLI интеграция."""
+    def get_command(self, session_id, model):
+        return ["claude", "--model", model or "sonnet", ...]
+```
 
 **Middleware:**
 
 ```python
 # Порядок применения (внешний → внутренний):
 1. SecurityHeadersMiddleware      # Security headers
-2. RequestSizeLimitMiddleware     # Лимит 5MB на запрос
+2. RequestSizeLimitMiddleware     # Лимит 50MB на запрос
 3. CORSMiddleware                 # CORS: allow_origins=["*"]
 ```
 
@@ -88,6 +117,42 @@ def write_file(path: str, content: str) -> str:
 @mcp.tool()
 def edit_file(path: str, old_string: str, new_string: str) -> str:
     """Редактирование файла (замена первого вхождения)."""
+
+@mcp.tool()
+def read_file(path: str) -> str:
+    """Чтение содержимого файла (лимит 2MB)."""
+
+@mcp.tool()
+def list_directory(path: str) -> str:
+    """Список файлов и директорий."""
+
+@mcp.tool()
+def glob(pattern: str, path: str = ".") -> str:
+    """Поиск файлов по шаблону."""
+
+@mcp.tool()
+def grep_search(pattern: str, path: str = ".", case_sensitive: bool = False) -> str:
+    """Поиск по содержимому файлов."""
+
+@mcp.tool()
+def web_fetch(url: str) -> str:
+    """Загрузка содержимого веб-страницы."""
+
+@mcp.tool()
+def web_search(query: str) -> str:
+    """Поиск в интернете."""
+
+@mcp.tool()
+def todo_write(todos: list) -> str:
+    """Управление списком задач."""
+
+@mcp.tool()
+def save_memory(key: str, value: str, session_id: str) -> str:
+    """Сохранение факта в долгосрочную память."""
+
+@mcp.tool()
+def read_memory(session_id: str) -> str:
+    """Чтение сохранённых фактов."""
 ```
 
 ### 2.3 Фронтенд (`static/src/`)
@@ -99,6 +164,8 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 - Tailwind CSS 4.1.17
 - Framer Motion (анимации)
 - Highlight.js (подсветка кода)
+- Lucide React (иконки)
+- Marked (Markdown рендеринг)
 
 **Основные компоненты:**
 
@@ -106,12 +173,15 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 |-----------|------------|
 | `App.tsx` | Главный компонент, управление состоянием |
 | `Sidebar.tsx` | Список сессий |
-| `ChatHeader.tsx` | Заголовок чата |
+| `ChatHeader.tsx` | Заголовок чата с информацией о сессии |
 | `ChatInput.tsx` | Поле ввода сообщения |
 | `MessageBubble.tsx` | Отображение сообщений |
 | `ConfirmBar.tsx` | Панель подтверждения операций |
-| `StatusBar.tsx` | Индикатор состояния |
-| `SettingsModal.tsx` | Настройки сессии |
+| `StatusBar.tsx` | Индикатор состояния WebSocket |
+| `SettingsModal.tsx` | Настройки сессии (provider, model, промпт) |
+| `EmptyState.tsx` | Заглушка при отсутствии сессии |
+| `ThinkingBlock.tsx` | Блок отображения мышления модели |
+| `ToolBlock.tsx` | Блок отображения вызовов инструментов |
 
 ---
 
@@ -121,8 +191,8 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 
 ```
 ┌──────────┐     ┌───────────┐     ┌────────────┐     ┌──────────┐     ┌─────────┐
-│ Браузер  │────▶│ FastAPI   │────▶│ qwen CLI   │────▶│ MCP      │────▶│ Система │
-│ (WebSocket)│   │ (server.py)│   │ (SDK mode) │   │ (tools)  │     │         │
+│ Браузер  │────▶│ FastAPI   │────▶│ Qwen/Claude│────▶│ MCP      │────▶│ Система │
+│ (WebSocket)│   │ (server.py)│   │ CLI        │   │ (tools)  │     │         │
 └──────────┘     └───────────┘     └────────────┘     └──────────┘     └─────────┘
      │                │                  │                  │                │
      │ 1. message     │                  │                  │                │
@@ -197,17 +267,21 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
    - Загрузка истории сообщений из БД
    - Получение кастомного системного промпта (если есть)
    - Инъекция сохранённой памяти через `read_memory_for_session()`
-   - Полный контекст передаётся без обрезки (управление лимитами — на стороне qwen-cli)
+   - Полный контекст передаётся без обрезки (управление лимитами — на стороне CLI)
 
-3. **Запуск qwen CLI:**
+3. **Запуск CLI:**
    ```python
+   # Получение провайдера и модели из сессии
+   provider = session.get("provider", "qwen")
+   model = session.get("model")
+   
    # Если есть история и валидный UUID — resume сессии
    if has_history and is_valid_uuid:
-       proc = run_qwen_cli_sdk(resume_id=session_id)
+       proc = run_cli(resume_id=session_id, provider=provider, model=model)
    elif is_valid_uuid:
-       proc = run_qwen_cli_sdk(session_id=session_id)
+       proc = run_cli(session_id=session_id, provider=provider, model=model)
    else:
-       proc = run_qwen_cli_sdk()  # Без контекста
+       proc = run_cli(provider=provider, model=model)  # Без контекста
    ```
 
 4. **Инициализация SDK mode:**
@@ -217,7 +291,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
    ```
 
 5. **Чтение потока ответов:**
-   - Цикл чтения stdout qwen процесса
+   - Цикл чтения stdout CLI процесса
    - Парсинг JSON строк (SDK format)
    - Обработка типов: `thinking`, `text`, `tool_use`, `tool_result`
 
@@ -225,7 +299,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
    - Если `connection_state["allow_all"]` — авто-одобрение
    - Иначе — отправка `confirm_request` клиенту
    - Ожидание `confirm_response` через `_wait_for_confirmation()`
-   - Отправка `control_response` обратно в qwen
+   - Отправка `control_response` обратно в CLI
 
 7. **Завершение:**
    - Сохранение сообщений в БД в правильном порядке
@@ -291,11 +365,11 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 | `session_renamed` | `id: string`, `title: string` | Сессия переименована |
 | `ping` | — | Heartbeat (каждые 30 сек) |
 
-### 4.2 qwen CLI SDK protocol
+### 4.2 CLI SDK protocol
 
 **Формат:** JSON Lines (каждое сообщение на отдельной строке)
 
-**Типы сообщений от qwen:**
+**Типы сообщений от CLI:**
 
 ```json
 // Инициализация
@@ -332,7 +406,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 {"type": "result", "result": {"content": [...]}}
 ```
 
-**Ответы сервера в qwen:**
+**Ответы сервера в CLI:**
 
 ```json
 // Разрешение инструмента
@@ -352,32 +426,19 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 
 ### 5.1 Структура промпта
 
-Системный промпт определяется в константе `SYSTEM_PROMPT` и включает:
+Системный промпт определяется в `system_prompt.py` и включает разные версии для Qwen и Claude.
 
-1. **Роль и среда:**
-   - Определение роли AI-ассистента
-   - Информация об ОС, хостнейме, Python версии
-   - Рабочие директории
+**Qwen промпт:**
+- Список всех доступных инструментов
+- Принципы работы (ДЕЙСТВУЙ НЕ РАССУЖДАЙ, РАЗБИВАЙ СЛОЖНЫЕ ЗАДАЧИ, etc.)
+- Примеры правильного поведения
+- Информация о сервисе
 
-2. **Доступные инструменты:**
-   - Список всех доступных инструментов
-   - Краткое описание каждого
-
-3. **Принципы работы:**
-   ```
-   1. ДЕЙСТВУЙ, НЕ РАССУЖДАЙ
-   2. РАЗБИВАЙ СЛОЖНЫЕ ЗАДАЧИ
-   3. МИНИМУМ ТЕКСТА, МАКСИМУМ ДЕЛА
-   4. ЗАПОМИНАЙ ВАЖНОЕ
-   5. ПРОВЕРЯЙ РЕЗУЛЬТАТЫ
-   6. БЕЗОПАСНОСТЬ
-   ```
-
-4. **Примеры правильного поведения:**
-   ```
-   ПЛОХО: «Я могу проверить содержимое директории командой ls»
-   ХОРОШО: [вызов list_directory(path="/home/andrew/qwen-agent")]
-   ```
+**Claude промпт:**
+- Список инструментов Claude CLI (Bash, Read, Write, Edit, TodoWrite)
+- Важное замечание о TodoWrite (не отправляет сообщения)
+- Принципы работы
+- Примеры правильного поведения
 
 ### 5.2 Инъекция памяти
 
@@ -407,7 +468,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 **Применение:**
 ```python
 custom_prompt = get_session_prompt(sid)
-effective_prompt = custom_prompt or SYSTEM_PROMPT
+effective_prompt = custom_prompt or get_system_prompt(provider)
 ```
 
 ---
@@ -429,7 +490,7 @@ effective_prompt = custom_prompt or SYSTEM_PROMPT
 
 **Тело запроса:**
 ```json
-{"title": "Мой новый чат"}
+{"title": "Мой новый чат", "provider": "qwen", "model": null}
 ```
 
 **Ответ:**
@@ -438,13 +499,15 @@ effective_prompt = custom_prompt or SYSTEM_PROMPT
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "title": "Мой новый чат",
   "created_at": "2026-03-01T12:00:00",
-  "updated_at": "2026-03-01T12:00:00"
+  "updated_at": "2026-03-01T12:00:00",
+  "provider": "qwen",
+  "model": null
 }
 ```
 
 **Процесс:**
 1. Генерация UUID v4
-2. Запись в таблицу `sessions`
+2. Запись в таблицу `sessions` с provider/model
 3. Возврат данных клиенту
 
 ### 6.3 Автоматическое переименование
@@ -464,12 +527,12 @@ def auto_title(session_id: str, user_msg: str):
 **Функция `build_history()`:**
 
 1. **Базовый контекст:**
-   - Системный промпт
+   - Системный промпт (по провайдеру)
    - Инъекция памяти
    - История сообщений (user/assistant/tool)
 
 2. **Без искусственных ограничений:**
-   Полный контекст передаётся в qwen-cli. Управление лимитами контекста и результатов инструментов — на стороне qwen-cli.
+   Полный контекст передаётся в CLI. Управление лимитами контекста и результатов инструментов — на стороне CLI.
 
 ---
 
@@ -545,22 +608,28 @@ params = StdioServerParameters(
 
 ```python
 TOOLS_REQUIRING_CONFIRMATION = {
+    # Bash/Shell инструменты
     "Bash", "bash", "run_bash_command", "execute_command",
     "run_command", "shell", "run_shell_command",
+    # SSH инструменты
     "ssh", "SSH", "run_ssh_command", "remote_command",
-    "Write", "write_file", "create_file",
-    "Edit", "edit_file", "replace_in_file",
+    # Файловые инструменты (опасные)
+    "Write", "write_file", "create_file", "WriteFile",
+    "Edit", "edit_file", "replace_in_file", "EditFile",
+    "delete_file", "remove_file", "rm_file",
+    # Операционные системы
+    "system_reboot", "system_shutdown", "reboot", "shutdown",
 }
 ```
 
 **Механизм подтверждения:**
 
-1. qwen отправляет `control_request` (can_use_tool)
+1. CLI отправляет `control_request` (can_use_tool)
 2. Сервер проверяет название инструмента
 3. Если требует подтверждения:
    - Отправка `confirm_request` клиенту
    - Ожидание через `_wait_for_confirmation()`
-   - Отправка `control_response` в qwen
+   - Отправка `control_response` в CLI
 4. Если `allow_all` — авто-одобрение
 
 ---
@@ -596,9 +665,10 @@ app.add_middleware(
 
 | Лимит | Значение |
 |-------|----------|
-| `MAX_REQUEST_SIZE` | 5 MB |
+| `MAX_REQUEST_SIZE` | 50 MB |
 | Таймаут bash/ssh | 120 секунд |
 | Таймаут подтверждения | 300 секунд |
+| Лимит чтения файла (MCP) | 2 MB |
 
 ---
 
@@ -614,7 +684,9 @@ CREATE TABLE sessions (
     title TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    system_prompt TEXT DEFAULT NULL
+    system_prompt TEXT DEFAULT NULL,
+    provider TEXT DEFAULT 'qwen',  -- qwen/claude
+    model TEXT DEFAULT NULL        -- opus/sonnet/haiku
 );
 ```
 
@@ -707,20 +779,20 @@ def save_memory(key: str, value: str, session_id: str) -> str:
 | Тип | Обработка |
 |-----|-----------|
 | WebSocket disconnect | Логирование, очистка ресурсов |
-| qwen process crash | Fallback на новый запуск |
+| CLI process crash | Fallback на новый запуск |
 | MCP session error | Пересоздание сессии |
 | Database error | Логирование, возврат ошибки клиенту |
 | Timeout | Отправка `error` сообщения |
 
 ### 10.2 Механизм восстановления
 
-**При ошибке qwen процесса:**
+**При ошибке CLI процесса:**
 
 ```python
 # Fallback: если процесс умер
 if init_resp is None and proc.poll() is not None:
-    logger.warning(f"qwen процесс завершился, пробуем без --resume")
-    proc = run_qwen_cli_sdk(session_id=session_id)
+    logger.warning(f"CLI процесс завершился, пробуем без --resume")
+    proc = run_cli(session_id=session_id, provider=provider, model=model)
     proc.stdin.write(init_msg + "\n")
     proc.stdin.flush()
     await _wait_for_init_response(proc)
@@ -759,6 +831,7 @@ except Exception:
 | Переменная | Описание | По умолчанию |
 |------------|----------|--------------|
 | `QWEN_PATH` | Путь к qwen CLI | автоопределение |
+| `CLAUDE_PATH` | Путь к claude CLI | автоопределение |
 | `MCP_PYTHON` | Python для MCP | `sys.executable` |
 
 ### B. Порты
@@ -774,10 +847,12 @@ except Exception:
 |------|------------|
 | `server.py` | Основной сервер |
 | `mcp_tools_server.py` | MCP инструменты |
+| `system_prompt.py` | Системные промпты |
 | `sessions.db` | SQLite база |
 | `server.log` | Логи |
 | `static/dist/` | Сборка фронтенда |
 | `.env` | Переменные окружения |
+| `mcp_config.json` | MCP конфиг для IDE |
 
 ---
 
