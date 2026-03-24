@@ -428,18 +428,23 @@ def web_search(query: str) -> str:
         results = []
         # Ищем ссылки в результатах
         import re
-        matches = re.findall(r'<a class="result__snippet"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', html, re.DOTALL)
+        matches = re.findall(r'<a class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', html, re.DOTALL)
 
-        for href, snippet in matches[:10]:
-            # Очищаем HTML теги из сниппета
-            clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-            clean_href = href.split('?')[0]  # Убираем параметры
-            results.append(f"- {clean_snippet}\n  URL: {clean_href}")
+        for href, title in matches[:10]:
+            # Очищаем HTML теги из заголовка
+            clean_title = re.sub(r'<[^>]+>', '', title).strip()
+            # DuckDuckGo возвращает относительные ссылки - конвертируем в абсолютные
+            if href.startswith('/l/?uddg='):
+                # Извлекаем оригинальный URL из редиректа
+                clean_href = urllib.parse.unquote(href.replace('/l/?uddg=', '').split('&rutime=')[0])
+            else:
+                clean_href = href.split('?')[0]
+            results.append(f"- **{clean_title}**\n  [{clean_href}]({clean_href})")
 
         if not results:
             return "Ничего не найдено"
 
-        return f"Результаты поиска '{query}':\n\n" + "\n".join(results)
+        return f"Результаты поиска '{query}':\n\n" + "\n\n".join(results)
 
     except Exception as e:
         return f"Error: {str(e)}"
