@@ -113,7 +113,7 @@ function OrbitingDot({ delay, size, radius, duration, color }: {
 export default function EmptyState({ hasSession }: Props) {
   if (!hasSession) {
     return (
-      <div className="flex-1 flex items-center justify-center p-8 relative">
+      <div data-testid="empty-state" className="flex-1 flex items-center justify-center p-8 relative">
         {/* Background aurora effect */}
         <div className="absolute inset-0 overflow-hidden pointer-events-none">
           <motion.div

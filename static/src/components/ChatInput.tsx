@@ -103,6 +103,7 @@ export default function ChatInput({
 
             <textarea
               ref={textareaRef}
+              data-testid="chat-input"
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={handleKeyDown}
@@ -144,6 +145,7 @@ export default function ChatInput({
             {isBusy ? (
               <motion.button
                 key="stop"
+                data-testid="stop-button"
                 initial={{ scale: 0, rotate: -90 }}
                 animate={{ scale: 1, rotate: 0 }}
                 exit={{ scale: 0, rotate: 90 }}
@@ -157,6 +159,7 @@ export default function ChatInput({
             ) : (
               <motion.button
                 key="send"
+                data-testid="send-button"
                 initial={{ scale: 0, rotate: 90 }}
                 animate={{ scale: 1, rotate: 0 }}
                 exit={{ scale: 0, rotate: -90 }}

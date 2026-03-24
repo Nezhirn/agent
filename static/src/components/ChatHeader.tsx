@@ -31,6 +31,7 @@ export default function ChatHeader({
       <div className="flex items-center gap-3 min-w-0">
         <button
           onClick={onToggleSidebar}
+          data-testid="menu-button"
           className="lg:hidden p-2 rounded-xl hover:bg-bg-hover text-text-secondary transition-all duration-200 hover:text-text-primary active:scale-95"
         >
           <Menu size={20} />
@@ -59,6 +60,7 @@ export default function ChatHeader({
         <div className="flex items-center gap-2">
           {/* Provider selector */}
           <select
+            data-testid="provider-select"
             value={provider}
             onChange={(e) => onProviderChange?.(e.target.value as 'qwen' | 'claude')}
             className="px-2 py-1 text-xs rounded-lg bg-bg-primary/80 border border-border/60 text-text-primary outline-none focus:border-accent/40 transition-all duration-200"
@@ -70,6 +72,7 @@ export default function ChatHeader({
           {/* Model selector (only for Claude) */}
           {provider === 'claude' && (
             <select
+              data-testid="model-select"
               value={model}
               onChange={(e) => onModelChange?.(e.target.value)}
               className="px-2 py-1 text-xs rounded-lg bg-bg-primary/80 border border-border/60 text-text-primary outline-none focus:border-accent/40 transition-all duration-200"
@@ -95,6 +98,7 @@ export default function ChatHeader({
             animate={{ opacity: 1, rotate: 0 }}
             transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
             onClick={onOpenSettings}
+            data-testid="settings-button"
             className="p-2 rounded-xl hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-all duration-300 hover:rotate-90 active:scale-90"
             title="Настройки"
           >

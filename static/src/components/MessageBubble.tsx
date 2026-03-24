@@ -80,7 +80,7 @@ export default function MessageBubble({
 
   if (role === 'user') {
     return (
-      <div className="flex justify-end">
+      <div data-testid="user-message" className="flex justify-end">
         <div className="flex items-end gap-2.5 max-w-[80%] lg:max-w-[65%]">
           <div className="relative group">
             {/* Glow effect */}

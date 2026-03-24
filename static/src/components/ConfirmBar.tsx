@@ -29,6 +29,7 @@ export default function ConfirmBar({ name, args, onAction }: Props) {
 
   return (
     <motion.div
+      data-testid="confirm-bar"
       initial={{ opacity: 0, y: 30, height: 0 }}
       animate={{ opacity: 1, y: 0, height: 'auto' }}
       exit={{ opacity: 0, y: 30, height: 0 }}

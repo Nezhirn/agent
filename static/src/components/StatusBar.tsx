@@ -88,6 +88,7 @@ export default function StatusBar({ phase, startTime, wsStatus = 'connected', al
 
   return (
     <motion.div
+      data-testid="status-bar"
       initial={{ opacity: 0, y: 10, height: 0 }}
       animate={{ opacity: 1, y: 0, height: 'auto' }}
       exit={{ opacity: 0, y: 10, height: 0 }}
